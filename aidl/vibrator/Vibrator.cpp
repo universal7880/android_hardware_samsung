@@ -103,15 +103,13 @@ Vibrator::Vibrator() {
 }
 
 ndk::ScopedAStatus Vibrator::getCapabilities(int32_t* _aidl_return) {
-    *_aidl_return = IVibrator::CAP_ON_CALLBACK | IVibrator::CAP_PERFORM_CALLBACK |
-                    IVibrator::CAP_EXTERNAL_CONTROL /*| IVibrator::CAP_COMPOSE_EFFECTS |
-                    IVibrator::CAP_ALWAYS_ON_CONTROL*/;
+    *_aidl_return = IVibrator::CAP_ON_CALLBACK | IVibrator::CAP_PERFORM_CALLBACK;
 
 #ifdef VIBRATOR_SUPPORTS_DURATION_AMPLITUDE_CONTROL
-    *_aidl_return |= IVibrator::CAP_AMPLITUDE_CONTROL | IVibrator::CAP_EXTERNAL_AMPLITUDE_CONTROL;
+    *_aidl_return |= IVibrator::CAP_AMPLITUDE_CONTROL;
 #else
     if (mHasTimedOutIntensity)
-        *_aidl_return |= IVibrator::CAP_AMPLITUDE_CONTROL | IVibrator::CAP_EXTERNAL_AMPLITUDE_CONTROL;
+        *_aidl_return |= IVibrator::CAP_AMPLITUDE_CONTROL;
 #endif
 
     if (mIsForceFeedbackVibrator)
@@ -249,16 +247,8 @@ ndk::ScopedAStatus Vibrator::setAmplitude(float amplitude) {
     return ndk::ScopedAStatus::ok();
 }
 
-ndk::ScopedAStatus Vibrator::setExternalControl(bool enabled) {
-    if (mEnabled) {
-        LOG(WARNING) << "Setting external control while the vibrator is enabled is "
-                        "unsupported!";
-        return ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
-    }
-
-    LOG(INFO) << "ExternalControl: " << mExternalControl << " -> " << enabled;
-    mExternalControl = enabled;
-    return ndk::ScopedAStatus::ok();
+ndk::ScopedAStatus Vibrator::setExternalControl(bool /*enabled*/) {
+    return ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
 }
 
 ndk::ScopedAStatus Vibrator::getCompositionDelayMax(int32_t* /*_aidl_return*/) {

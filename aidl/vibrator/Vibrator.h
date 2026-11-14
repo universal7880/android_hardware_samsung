@@ -78,8 +78,6 @@ private:
     float mDurationAmplitude;
 #endif
 
-    bool mEnabled{false};
-    bool mExternalControl{false};
     std::mutex mMutex;
 
     bool mIsTimedOutVibrator;
