@@ -43,6 +43,15 @@
 
 #include <samsung_audio.h>
 
+#ifdef SOUND_FM_VENDOR_CAPTURE
+#include <cutils/sockets.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include <hardware/audio_effect.h>
 #include <system/thread_defs.h>
 #include <audio_effects/effect_aec.h>
@@ -3306,6 +3315,16 @@ static int in_standby_l(struct stream_in *in)
     return status;
 }
 
+#ifdef SOUND_FM_VENDOR_CAPTURE
+static void preempt_fm_capture(struct audio_device *adev)
+{
+    if (adev->fm_input != NULL) {
+        in_standby_l(adev->fm_input);
+        adev->fm_input = NULL;
+    }
+}
+#endif
+
 static int in_standby(struct audio_stream *stream)
 {
     struct stream_in *in = (struct stream_in *)stream;
@@ -3442,6 +3461,9 @@ static ssize_t in_read(struct audio_stream_in *stream, void *buffer,
     if (in->standby) {
         pthread_mutex_unlock(&in->lock);
         pthread_mutex_lock(&adev->lock_inputs);
+#ifdef SOUND_FM_VENDOR_CAPTURE
+        preempt_fm_capture(adev);
+#endif
         lock_input_stream(in);
         if (!in->standby) {
             pthread_mutex_unlock(&adev->lock_inputs);
@@ -4022,6 +4044,11 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
 {
     struct audio_device *adev = (struct audio_device *)dev;
 
+#ifdef SOUND_FM_VENDOR_CAPTURE
+    pthread_mutex_lock(&adev->lock_inputs);
+    if (mode != AUDIO_MODE_NORMAL)
+        preempt_fm_capture(adev);
+#endif
     pthread_mutex_lock(&adev->lock);
     if (adev->mode != mode) {
         ALOGI("%s mode = %d", __func__, mode);
@@ -4035,6 +4062,9 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
         }
     }
     pthread_mutex_unlock(&adev->lock);
+#ifdef SOUND_FM_VENDOR_CAPTURE
+    pthread_mutex_unlock(&adev->lock_inputs);
+#endif
     return 0;
 }
 
@@ -4216,6 +4246,174 @@ static void adev_close_input_stream(struct audio_hw_device *dev,
     return;
 }
 
+#ifdef SOUND_FM_VENDOR_CAPTURE
+/* The control peer stays connected for the lifetime of the pipe. */
+static int receive_fm_pipe(int client, int stop_fd)
+{
+    struct pollfd fds[] = {
+        { .fd = client, .events = POLLIN },
+        { .fd = stop_fd, .events = POLLIN },
+    };
+    if (TEMP_FAILURE_RETRY(poll(fds, 2, 250)) <= 0 || fds[1].revents ||
+        !(fds[0].revents & POLLIN))
+        return -1;
+
+    char tag;
+    struct iovec iov = { .iov_base = &tag, .iov_len = sizeof(tag) };
+    union {
+        struct cmsghdr alignment;
+        char data[CMSG_SPACE(sizeof(int))];
+    } control;
+    struct msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = control.data,
+        .msg_controllen = sizeof(control.data),
+    };
+    if (TEMP_FAILURE_RETRY(recvmsg(client, &msg, MSG_CMSG_CLOEXEC)) != 1)
+        return -1;
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg || cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS ||
+        cmsg->cmsg_len < CMSG_LEN(sizeof(int)))
+        return -1;
+    int writer;
+    memcpy(&writer, CMSG_DATA(cmsg), sizeof(writer));
+    if (tag != 'F' || msg.msg_flags & MSG_CTRUNC ||
+        cmsg->cmsg_len != CMSG_LEN(sizeof(writer))) {
+        for (size_t i = 0; i < (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int); i++) {
+            int fd;
+            memcpy(&fd, CMSG_DATA(cmsg) + i * sizeof(int), sizeof(fd));
+            close(fd);
+        }
+        return -1;
+    }
+    return writer;
+}
+
+static bool send_fm_period(struct audio_device *adev, int client, int writer,
+                           const void *samples, size_t size)
+{
+    const uint8_t *data = samples;
+    struct pollfd fds[] = {
+        { .fd = writer, .events = POLLOUT },
+        { .fd = client, .events = POLLIN },
+        { .fd = adev->fm_stop_fd, .events = POLLIN },
+    };
+    while (size != 0) {
+        int ready = TEMP_FAILURE_RETRY(poll(fds, 3, 250));
+        if (ready <= 0 || fds[1].revents || fds[2].revents ||
+            (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)))
+            return false;
+        ssize_t sent = TEMP_FAILURE_RETRY(write(writer, data, size));
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        if (sent <= 0)
+            return false;
+        data += sent;
+        size -= sent;
+    }
+    return true;
+}
+
+/* This stream shares the primary capture PCM with AudioFlinger. The regular
+ * input and call paths take priority. Never accept a route from the client. */
+static void serve_fm_capture(struct audio_device *adev, int client, int writer)
+{
+    struct audio_config config = {
+        .sample_rate = CAPTURE_DEFAULT_SAMPLING_RATE,
+        .channel_mask = AUDIO_CHANNEL_IN_STEREO,
+        .format = AUDIO_FORMAT_PCM_16_BIT,
+    };
+    struct audio_stream_in *stream;
+    if (adev_open_input_stream(&adev->device, 0, AUDIO_DEVICE_IN_FM_TUNER, &config,
+                              &stream, AUDIO_INPUT_FLAG_NONE, "", AUDIO_SOURCE_FM_TUNER) != 0)
+        return;
+    struct stream_in *in = (struct stream_in *)stream;
+    pthread_mutex_lock(&adev->lock_inputs);
+    pthread_mutex_lock(&adev->lock);
+    int status = -EBUSY;
+    if (adev->active_input == NULL && adev->mode == AUDIO_MODE_NORMAL) {
+        status = start_input_stream(in);
+        if (status == 0) {
+            in->standby = 0;
+            adev->fm_input = in;
+        }
+    }
+    pthread_mutex_unlock(&adev->lock);
+    pthread_mutex_unlock(&adev->lock_inputs);
+
+    int16_t samples[CAPTURE_PERIOD_SIZE * CAPTURE_DEFAULT_CHANNEL_COUNT];
+    struct pollfd stop = { .fd = adev->fm_stop_fd, .events = POLLIN };
+    while (status == 0 && poll(&stop, 1, 0) == 0) {
+        pthread_mutex_lock(&adev->lock_inputs);
+        ssize_t frames = -EBUSY;
+        if (adev->fm_input == in) {
+            lock_input_stream(in);
+            frames = read_and_process_frames(in, samples, CAPTURE_PERIOD_SIZE);
+            pthread_mutex_unlock(&in->lock);
+        }
+        pthread_mutex_unlock(&adev->lock_inputs);
+        if (frames != CAPTURE_PERIOD_SIZE ||
+            !send_fm_period(adev, client, writer, samples, sizeof(samples)))
+            break;
+    }
+
+    pthread_mutex_lock(&adev->lock_inputs);
+    if (adev->fm_input == in)
+        preempt_fm_capture(adev);
+    pthread_mutex_unlock(&adev->lock_inputs);
+    adev_close_input_stream(&adev->device, stream);
+}
+
+static void *fm_capture_thread(void *data)
+{
+    struct audio_device *adev = data;
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGPIPE);
+    if (pthread_sigmask(SIG_BLOCK, &signals, NULL) != 0)
+        return NULL;
+
+    struct pollfd fds[] = {
+        { .fd = adev->fm_listen_fd, .events = POLLIN },
+        { .fd = adev->fm_stop_fd, .events = POLLIN },
+    };
+    for (;;) {
+        int ret = poll(fds, 2, -1);
+        if (ret < 0 && errno == EINTR)
+            continue;
+        if (ret <= 0 || fds[1].revents || !(fds[0].revents & POLLIN))
+            break;
+        int client = accept4(fds[0].fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+        if (client < 0)
+            continue;
+        int writer = receive_fm_pipe(client, adev->fm_stop_fd);
+        if (writer >= 0) {
+            serve_fm_capture(adev, client, writer);
+            close(writer);
+        }
+        close(client);
+    }
+    return NULL;
+}
+
+static void start_fm_capture_server(struct audio_device *adev)
+{
+    adev->fm_stop_fd = -1;
+    adev->fm_listen_fd = android_get_control_socket("universal7880_fm_audio");
+    if (adev->fm_listen_fd < 0)
+        return;
+    adev->fm_stop_fd = eventfd(0, EFD_CLOEXEC);
+    if (adev->fm_stop_fd < 0)
+        return;
+    if (pthread_create(&adev->fm_thread, NULL, fm_capture_thread, adev) != 0) {
+        close(adev->fm_stop_fd);
+        adev->fm_stop_fd = -1;
+    }
+}
+#endif
+
 static int adev_dump(const audio_hw_device_t *device, int fd)
 {
     (void)device;
@@ -4227,6 +4425,14 @@ static int adev_dump(const audio_hw_device_t *device, int fd)
 static int adev_close(hw_device_t *device)
 {
     struct audio_device *adev = (struct audio_device *)device;
+#ifdef SOUND_FM_VENDOR_CAPTURE
+    if (adev->fm_stop_fd >= 0) {
+        const uint64_t stop = 1;
+        TEMP_FAILURE_RETRY(write(adev->fm_stop_fd, &stop, sizeof(stop)));
+        pthread_join(adev->fm_thread, NULL);
+        close(adev->fm_stop_fd);
+    }
+#endif
     voice_session_deinit(adev->voice.session);
     audio_device_ref_count--;
     if (audio_device_ref_count == 0) {
@@ -4378,6 +4584,9 @@ static int adev_open(const hw_module_t *module, const char *name,
         }
     }
 
+#ifdef SOUND_FM_VENDOR_CAPTURE
+    start_fm_capture_server(adev);
+#endif
     ALOGV("%s: exit", __func__);
     return 0;
 }
