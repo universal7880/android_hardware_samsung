@@ -381,6 +381,12 @@ struct audio_device {
     struct listnode         mixer_list;
     audio_mode_t            mode;
     struct stream_in*       active_input;
+#ifdef SOUND_FM_VENDOR_CAPTURE
+    struct stream_in *fm_input;
+    int fm_listen_fd;
+    int fm_stop_fd;
+    pthread_t fm_thread;
+#endif
     struct stream_out*      primary_output;
     bool                    mic_mute;
     bool                    screen_off;
