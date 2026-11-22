@@ -74,6 +74,25 @@ struct pcm_config pcm_config_voice_sco_wb = {
 int start_voice_call(struct audio_device *adev);
 int stop_voice_call(struct audio_device *adev);
 
+#ifndef SOUND_MODEM_PATH_EARPIECE
+#define SOUND_MODEM_PATH_EARPIECE SOUND_AUDIO_PATH_EARPIECE
+#endif
+
+#ifndef SOUND_MODEM_PATH_SPEAKER
+#define SOUND_MODEM_PATH_SPEAKER SOUND_AUDIO_PATH_SPEAKER
+#endif
+
+static void set_voice_session_two_mic(struct voice_session *session)
+{
+    if (session->two_mic_control) {
+        ALOGV("%s: enabling two mic control", __func__);
+        ril_set_two_mic_control(&session->ril, AUDIENCE, TWO_MIC_SOLUTION_ON);
+    } else {
+        ALOGV("%s: disabling two mic control", __func__);
+        ril_set_two_mic_control(&session->ril, AUDIENCE, TWO_MIC_SOLUTION_OFF);
+    }
+}
+
 void set_voice_session_audio_path(struct voice_session *session)
 {
     enum _AudioPath device_type;
@@ -81,10 +100,10 @@ void set_voice_session_audio_path(struct voice_session *session)
 
     switch(session->out_device) {
         case AUDIO_DEVICE_OUT_SPEAKER:
-            device_type = SOUND_AUDIO_PATH_SPEAKER;
+            device_type = SOUND_MODEM_PATH_SPEAKER;
             break;
         case AUDIO_DEVICE_OUT_EARPIECE:
-            device_type = SOUND_AUDIO_PATH_EARPIECE;
+            device_type = SOUND_MODEM_PATH_EARPIECE;
             break;
         case AUDIO_DEVICE_OUT_WIRED_HEADSET:
             device_type = SOUND_AUDIO_PATH_HEADSET;
@@ -99,9 +118,13 @@ void set_voice_session_audio_path(struct voice_session *session)
             break;
         default:
             /* if output device isn't supported, use earpiece by default */
-            device_type = SOUND_AUDIO_PATH_EARPIECE;
+            device_type = SOUND_MODEM_PATH_EARPIECE;
             break;
     }
+
+#ifdef SOUND_VOICE_DUAL_MIC_BEFORE_PATH
+    set_voice_session_two_mic(session);
+#endif
 
     ALOGV("%s: ril_set_call_audio_path(%d)", __func__, device_type);
 
@@ -278,13 +301,9 @@ int start_voice_session(struct voice_session *session)
     es_start_voice_session(session);
 #endif
 
-    if (session->two_mic_control) {
-        ALOGV("%s: enabling two mic control", __func__);
-        ril_set_two_mic_control(&session->ril, AUDIENCE, TWO_MIC_SOLUTION_ON);
-    } else {
-        ALOGV("%s: disabling two mic control", __func__);
-        ril_set_two_mic_control(&session->ril, AUDIENCE, TWO_MIC_SOLUTION_OFF);
-    }
+#ifndef SOUND_VOICE_DUAL_MIC_BEFORE_PATH
+    set_voice_session_two_mic(session);
+#endif
 
     return 0;
 }
