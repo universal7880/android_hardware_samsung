@@ -216,7 +216,11 @@ int ril_set_call_audio_path(struct ril_handle *ril, enum _AudioPath path)
         return 0;
     }
 
+#ifdef RIL_CALL_AUDIO_PATH_EXTRAVOLUME
+    rc = SetCallAudioPath(ril->client, path, ORIGINAL_PATH);
+#else
     rc = SetCallAudioPath(ril->client, path);
+#endif
     if (rc != 0) {
         ALOGE("%s: SetCallAudioPath() failed, rc=%d", __func__, rc);
     }
