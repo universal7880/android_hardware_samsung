@@ -322,16 +322,14 @@ struct stream_in {
     size_t                              read_buf_size;
     size_t                              read_buf_frames;
 
-    int16_t *proc_buf_in;
     int16_t *proc_buf_out;
-    size_t proc_buf_size;
-    size_t proc_buf_frames;
+    size_t proc_buf_samples;
 
 #ifdef PREPROCESSING_ENABLED
     struct echo_reference_itfe *echo_reference;
-    int16_t *ref_buf;
-    size_t ref_buf_size;
-    size_t ref_buf_frames;
+    int16_t *effect_buf;
+    size_t effect_buf_samples;
+    size_t effect_frames_pending;
     int num_preprocessors;
     struct effect_info_s preprocessors[MAX_PREPROCESSORS];
 
