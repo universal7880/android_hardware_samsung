@@ -333,7 +333,6 @@ struct stream_in {
     int num_preprocessors;
     struct effect_info_s preprocessors[MAX_PREPROCESSORS];
 
-    bool aux_channels_changed;
     uint32_t aux_channels;
 #endif
 
