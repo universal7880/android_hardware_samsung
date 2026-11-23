@@ -2050,6 +2050,8 @@ static int start_input_stream(struct stream_in *in)
                                RESAMPLER_QUALITY_DEFAULT,
                                &in->buf_provider,
                                &in->resampler);
+        if (ret != 0)
+            goto error_open;
     }
 
 #ifdef PREPROCESSING_ENABLED
@@ -3718,26 +3720,6 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
         out->sample_rate = out->config.rate;
     }
 
-    if (flags & AUDIO_OUTPUT_FLAG_PRIMARY) {
-        if (adev->primary_output == NULL)
-            adev->primary_output = out;
-        else {
-            ALOGE("%s: Primary output is already opened", __func__);
-            ret = -EEXIST;
-            goto error_open;
-        }
-    }
-
-    /* Check if this usecase is already existing */
-    pthread_mutex_lock(&adev->lock);
-    if (get_usecase_from_id(adev, out->usecase) != NULL) {
-        ALOGE("%s: Usecase (%d) is already present", __func__, out->usecase);
-        pthread_mutex_unlock(&adev->lock);
-        ret = -EEXIST;
-        goto error_open;
-    }
-    pthread_mutex_unlock(&adev->lock);
-
     out->stream.common.get_sample_rate = out_get_sample_rate;
     out->stream.common.set_sample_rate = out_set_sample_rate;
     out->stream.common.get_buffer_size = out_get_buffer_size;
@@ -3771,6 +3753,25 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
 
     out->is_fastmixer_affinity_set = false;
 
+    pthread_mutex_lock(&adev->lock);
+    if (get_usecase_from_id(adev, out->usecase) != NULL ||
+        ((flags & AUDIO_OUTPUT_FLAG_PRIMARY) && adev->primary_output != NULL)) {
+        pthread_mutex_unlock(&adev->lock);
+        ALOGE("%s: Output is already opened for usecase %d", __func__, out->usecase);
+        ret = -EEXIST;
+        if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
+            destroy_offload_callback_thread(out);
+            free(out->compr_config.codec);
+        }
+        pthread_cond_destroy(&out->cond);
+        pthread_mutex_destroy(&out->lock);
+        pthread_mutex_destroy(&out->pre_lock);
+        goto error_open;
+    }
+    if (flags & AUDIO_OUTPUT_FLAG_PRIMARY)
+        adev->primary_output = out;
+    pthread_mutex_unlock(&adev->lock);
+
     *stream_out = &out->stream;
     ALOGV("%s: exit", __func__);
     return 0;
@@ -3787,10 +3788,18 @@ static void adev_close_output_stream(struct audio_hw_device *dev,
                                      struct audio_stream_out *stream)
 {
     struct stream_out *out = (struct stream_out *)stream;
-    (void)dev;
+    struct audio_device *adev = (struct audio_device *)dev;
 
     ALOGV("%s: enter", __func__);
     out_standby(&stream->common);
+    pthread_mutex_lock(&adev->lock);
+    if (adev->primary_output == out) {
+        if (adev->voice.in_call)
+            stop_voice_call(adev);
+        adev->primary_output = NULL;
+    }
+    pthread_mutex_unlock(&adev->lock);
+
     if (out->usecase == USECASE_AUDIO_PLAYBACK_OFFLOAD) {
         destroy_offload_callback_thread(out);
 
