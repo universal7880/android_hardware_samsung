@@ -4057,7 +4057,7 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
         }
         adev->mode = mode;
 
-        if ((mode == AUDIO_MODE_NORMAL) && adev->voice.in_call) {
+        if (mode != AUDIO_MODE_IN_CALL && adev->voice.in_call) {
             stop_voice_call(adev);
         }
     }
