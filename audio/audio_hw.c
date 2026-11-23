@@ -1631,6 +1631,9 @@ static void in_update_aux_channels(struct stream_in *in,
     int status;
 
     aux_channels = in_get_aux_channels(in);
+    if (audio_channel_count_from_in_mask(in->main_channels | aux_channels) >
+        CAPTURE_DEFAULT_CHANNEL_COUNT)
+        aux_channels = 0;
 
     channel_config.main_channels = in->main_channels;
     channel_config.aux_channels = aux_channels;
@@ -1646,9 +1649,7 @@ static void in_update_aux_channels(struct stream_in *in,
         channel_config.aux_channels = 0;
         in_reconfigure_channels(in, effect, &channel_config, true);
     }
-    ALOGV("%s: aux_channels=%d, in->aux_channels_changed=%d", __func__, aux_channels, in->aux_channels_changed);
     if (in->aux_channels != aux_channels) {
-        in->aux_channels_changed = true;
         in->aux_channels = aux_channels;
         do_in_standby_l(in);
     }
@@ -1827,8 +1828,17 @@ static int get_next_buffer(struct resampler_buffer_provider *buffer_provider,
             buffer->frame_count = 0;
             return in->read_status;
         }
-        in->read_buf_frames = in->config.period_size;
+        const unsigned int pcm_channels = pcm_device->pcm_profile->config.channels;
+        const unsigned int channels = in->config.channels;
 
+        // The PCM device keeps its hardware format when effects request mono.
+        if (channels < pcm_channels) {
+            for (size_t i = 0; i < in->config.period_size; i++) {
+                memmove(in->read_buf + i * channels, in->read_buf + i * pcm_channels,
+                        channels * sizeof(*in->read_buf));
+            }
+        }
+        in->read_buf_frames = in->config.period_size;
     }
 
     buffer->frame_count = (buffer->frame_count > in->read_buf_frames) ?
@@ -1858,15 +1868,12 @@ static ssize_t read_frames(struct stream_in *in, void *buffer, ssize_t frames)
 {
     ssize_t frames_wr = 0;
 
-    struct pcm_device *pcm_device;
+    const size_t frame_size = in->config.channels * sizeof(int16_t);
 
     if (list_empty(&in->pcm_dev_list)) {
         ALOGE("%s: pcm device list empty", __func__);
         return -EINVAL;
     }
-
-    pcm_device = node_to_item(list_head(&in->pcm_dev_list),
-                              struct pcm_device, stream_list_node);
 
     while (frames_wr < frames) {
         size_t frames_rd = frames - frames_wr;
@@ -1875,7 +1882,7 @@ static ssize_t read_frames(struct stream_in *in, void *buffer, ssize_t frames)
         if (in->resampler != NULL) {
             in->resampler->resample_from_provider(in->resampler,
                     (int16_t *)((char *)buffer +
-                            pcm_frames_to_bytes(pcm_device->pcm, frames_wr)),
+                            frames_wr * frame_size),
                     &frames_rd);
         } else {
             struct resampler_buffer buf = {
@@ -1885,9 +1892,9 @@ static ssize_t read_frames(struct stream_in *in, void *buffer, ssize_t frames)
             get_next_buffer(&in->buf_provider, &buf);
             if (buf.raw != NULL) {
                 memcpy((char *)buffer +
-                            pcm_frames_to_bytes(pcm_device->pcm, frames_wr),
+                            frames_wr * frame_size,
                         buf.raw,
-                        pcm_frames_to_bytes(pcm_device->pcm, buf.frame_count));
+                        buf.frame_count * frame_size);
                 frames_rd = buf.frame_count;
             }
             release_buffer(&in->buf_provider, &buf);
@@ -2018,9 +2025,11 @@ static int start_input_stream(struct stream_in *in)
     in->config = pcm_profile->config;
 
 #ifdef PREPROCESSING_ENABLED
-    if (in->aux_channels_changed) {
-        in->config.channels = audio_channel_count_from_in_mask(in->main_channels | in->aux_channels);
-        recreate_resampler = true;
+    if (in->num_preprocessors != 0) {
+        unsigned int channels = audio_channel_count_from_in_mask(
+                in->main_channels | in->aux_channels);
+        if (channels <= pcm_profile->config.channels)
+            in->config.channels = channels;
     }
 #endif
 
@@ -3522,7 +3531,7 @@ static int add_remove_audio_effect(const struct audio_stream *stream,
             select_devices(in->dev, in->usecase);
     }
 #else
-    if ( (in->num_preprocessors > MAX_PREPROCESSORS) && (enable == true) ) {
+    if (enable && in->num_preprocessors >= MAX_PREPROCESSORS) {
         status = -ENOSYS;
         goto exit;
     }
@@ -3532,8 +3541,7 @@ static int add_remove_audio_effect(const struct audio_stream *stream,
         in_read_audio_effect_channel_configs(in, &in->preprocessors[in->num_preprocessors]);
         in->num_preprocessors ++;
         /* check compatibility between main channel supported and possible auxiliary channels */
-        in_update_aux_channels(in, effect);//wesley crash
-        in->aux_channels_changed = true;
+        in_update_aux_channels(in, effect);
     } else {
         /* if ( enable == false ) */
         if (in->num_preprocessors <= 0) {
@@ -3563,8 +3571,7 @@ static int add_remove_audio_effect(const struct audio_stream *stream,
         in->preprocessors[in->num_preprocessors].num_channel_configs = 0;
         in->preprocessors[in->num_preprocessors].effect_itfe = NULL;
         in->preprocessors[in->num_preprocessors].channel_configs = NULL;
-        in->aux_channels_changed = false;
-        ALOGV("%s: enable(%d), in->aux_channels_changed(%d)", __func__, enable, in->aux_channels_changed);
+        in_update_aux_channels(in, NULL);
     }
     in->effect_frames_pending = 0;
     ALOGI("%s:  num_preprocessors = %d", __func__, in->num_preprocessors);
@@ -3572,14 +3579,13 @@ static int add_remove_audio_effect(const struct audio_stream *stream,
     if ( memcmp(&desc.type, FX_IID_AEC, sizeof(effect_uuid_t)) == 0) {
         in->enable_aec = enable;
         ALOGV("add_remove_audio_effect(), FX_IID_AEC, enable: %d", enable);
-        if (!in->standby) {
+        if (!in->standby)
             select_devices(in->dev, in->usecase);
-            do_in_standby_l(in);
-        }
-        if (in->enable_aec == true) {
+        if (in->enable_aec)
             in_configure_reverse(in);
-        }
     }
+    if (!in->standby)
+        do_in_standby_l(in);
 exit:
 #endif
     ALOGW_IF(status != 0, "add_remove_audio_effect() error %d", status);
