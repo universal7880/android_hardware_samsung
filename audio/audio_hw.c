@@ -1154,7 +1154,7 @@ static int do_in_standby_l(struct stream_in *in);
 
 #ifdef PREPROCESSING_ENABLED
 static void get_capture_delay(struct stream_in *in,
-                              size_t frames __unused,
+                              size_t frames,
                               struct echo_reference_buffer *buffer)
 {
     ALOGVV("%s: enter:)", __func__);
@@ -1181,10 +1181,9 @@ static void get_capture_delay(struct stream_in *in,
     /* read frames available in audio HAL input buffer
      * add number of frames being read as we want the capture time of first sample
      * in current buffer */
-    /* frames in in->read_buf are at driver sampling rate while frames in in->proc_buf are
-     * at requested sampling rate */
+    /* The PCM buffer uses the driver rate and the effect block uses the requested rate. */
     buf_delay = (long)(((int64_t)(in->read_buf_frames) * 1000000000) / in->config.rate +
-                       ((int64_t)(in->proc_buf_frames) * 1000000000) / in->requested_rate );
+                       ((int64_t)frames * 1000000000) / in->requested_rate );
 
     /* add delay introduced by resampler */
     rsmp_delay = 0;
@@ -1200,54 +1199,10 @@ static void get_capture_delay(struct stream_in *in,
     buffer->delay_ns   = delay_ns;
     ALOGVV("get_capture_delay_time_stamp Secs: [%10ld], nSecs: [%9ld], kernel_frames:[%5d],"
          " delay_ns: [%d], kernel_delay:[%ld], buf_delay:[%ld], rsmp_delay:[%ld],  "
-         "in->read_buf_frames:[%zd], in->proc_buf_frames:[%zd], frames:[%zd]",
+         "in->read_buf_frames:[%zd], frames:[%zd]",
          buffer->time_stamp.tv_sec , buffer->time_stamp.tv_nsec, kernel_frames,
          buffer->delay_ns, kernel_delay, buf_delay, rsmp_delay,
-         in->read_buf_frames, in->proc_buf_frames, frames);
-}
-
-static int32_t update_echo_reference(struct stream_in *in, size_t frames)
-{
-    ALOGVV("%s: enter:), in->config.channels(%d)", __func__,in->config.channels);
-    struct echo_reference_buffer b;
-    b.delay_ns = 0;
-    struct pcm_device *pcm_device;
-
-    if (list_empty(&in->pcm_dev_list)) {
-        ALOGW("%s: pcm device list empty", __func__);
-        return b.delay_ns;
-    }
-
-    pcm_device = node_to_item(list_head(&in->pcm_dev_list),
-                              struct pcm_device, stream_list_node);
-
-    ALOGVV("update_echo_reference, in->config.channels(%d), frames = [%zd], in->ref_buf_frames = [%zd],  "
-          "b.frame_count = [%zd]",
-          in->config.channels, frames, in->ref_buf_frames, frames - in->ref_buf_frames);
-    if (in->ref_buf_frames < frames) {
-        if (in->ref_buf_size < frames) {
-            in->ref_buf_size = frames;
-            in->ref_buf = (int16_t *)realloc(in->ref_buf, pcm_frames_to_bytes(pcm_device->pcm, frames));
-            ALOG_ASSERT((in->ref_buf != NULL),
-                        "update_echo_reference() failed to reallocate ref_buf");
-            ALOGVV("update_echo_reference(): ref_buf %p extended to %d bytes",
-                      in->ref_buf, pcm_frames_to_bytes(pcm_device->pcm, frames));
-        }
-        b.frame_count = frames - in->ref_buf_frames;
-        b.raw = (void *)(in->ref_buf + in->ref_buf_frames * in->config.channels);
-
-        get_capture_delay(in, frames, &b);
-
-        if (in->echo_reference->read(in->echo_reference, &b) == 0)
-        {
-            in->ref_buf_frames += b.frame_count;
-            ALOGVV("update_echo_reference(): in->ref_buf_frames:[%zd], "
-                    "in->ref_buf_size:[%zd], frames:[%zd], b.frame_count:[%zd]",
-                 in->ref_buf_frames, in->ref_buf_size, frames, b.frame_count);
-        }
-    } else
-        ALOGW("update_echo_reference(): NOT enough frames to read ref buffer");
-    return b.delay_ns;
+         in->read_buf_frames, frames);
 }
 
 static int set_preprocessor_param(effect_handle_t handle,
@@ -1296,40 +1251,31 @@ static int set_preprocessor_echo_delay(effect_handle_t handle,
     return set_preprocessor_param(handle, effect_param);
 }
 
-static void push_echo_reference(struct stream_in *in, size_t frames)
+static void push_echo_reference(struct stream_in *in, int16_t *reference,
+                                int16_t *scratch, size_t frames)
 {
-    ALOGVV("%s: enter:)", __func__);
-    /* read frames from echo reference buffer and update echo delay
-     * in->ref_buf_frames is updated with frames available in in->ref_buf */
-
-    int32_t delay_us = update_echo_reference(in, frames)/1000;
-    int i;
-    audio_buffer_t buf;
-
-    if (in->ref_buf_frames < frames)
-        frames = in->ref_buf_frames;
-
-    buf.frameCount = frames;
-    buf.raw = in->ref_buf;
-
-    for (i = 0; i < in->num_preprocessors; i++) {
-        if ((*in->preprocessors[i].effect_itfe)->process_reverse == NULL)
-            continue;
-        ALOGVV("%s: effect_itfe)->process_reverse() BEGIN i=(%d) ", __func__, i);
-        (*in->preprocessors[i].effect_itfe)->process_reverse(in->preprocessors[i].effect_itfe,
-                                               &buf,
-                                               NULL);
-        ALOGVV("%s: effect_itfe)->process_reverse() END i=(%d) ", __func__, i);
-        set_preprocessor_echo_delay(in->preprocessors[i].effect_itfe, delay_us);
+    struct echo_reference_buffer ref = { .frame_count = frames, .raw = reference };
+    bool have_reference = false;
+    if (in->echo_reference != NULL) {
+        get_capture_delay(in, frames, &ref);
+        have_reference = in->echo_reference->read(in->echo_reference, &ref) == 0 &&
+                         ref.frame_count == frames;
     }
 
-    in->ref_buf_frames -= buf.frameCount;
-    ALOGVV("%s: in->ref_buf_frames(%zd), in->config.channels(%d) ",
-           __func__, in->ref_buf_frames, in->config.channels);
-    if (in->ref_buf_frames) {
-        memcpy(in->ref_buf,
-               in->ref_buf + buf.frameCount * in->config.channels,
-               in->ref_buf_frames * in->config.channels * sizeof(int16_t));
+    for (int i = 0; i < in->num_preprocessors; i++) {
+        effect_handle_t effect = in->preprocessors[i].effect_itfe;
+        if ((*effect)->process_reverse == NULL)
+            continue;
+
+        if (have_reference) {
+            audio_buffer_t input = { .frameCount = frames, .s16 = reference };
+            audio_buffer_t output = { .frameCount = frames, .s16 = scratch };
+            (*effect)->process_reverse(effect, &input, &output);
+        }
+
+        // WebRTC requires a delay update before every capture block.
+        int32_t delay_us = have_reference && ref.delay_ns > 0 ? ref.delay_ns / 1000 : 0;
+        set_preprocessor_echo_delay(effect, delay_us);
     }
 }
 
@@ -1342,11 +1288,9 @@ static void put_echo_reference(struct audio_device *adev,
 
     if (adev->echo_reference != NULL &&
             reference == adev->echo_reference) {
-        /* echo reference is taken from the low latency output stream used
-         * for voice use cases */
         adev->echo_reference = NULL;
         android_atomic_inc(&adev->echo_reference_generation);
-        if (out != NULL && out->usecase == USECASE_AUDIO_PLAYBACK) {
+        if (out != NULL) {
             // if the primary output is in standby or did not pick the echo reference yet
             // we can safely get rid of it here.
             // otherwise, out_write() or out_standby() will detect the change in echo reference
@@ -1367,10 +1311,9 @@ static struct echo_reference_itfe *get_echo_reference(struct audio_device *adev,
 {
     ALOGV("%s: enter:)", __func__);
     put_echo_reference(adev, adev->echo_reference);
-    /* echo reference is taken from the low latency output stream used
-     * for voice use cases */
-    if (adev->primary_output!= NULL && adev->primary_output->usecase == USECASE_AUDIO_PLAYBACK &&
-            !adev->primary_output->standby) {
+    // The primary output can use either normal or deep-buffer PCM playback.
+    if (adev->primary_output != NULL &&
+        adev->primary_output->usecase != USECASE_AUDIO_PLAYBACK_OFFLOAD) {
         struct audio_stream *stream =
                 &adev->primary_output->stream.common;
         uint32_t wr_channel_count = audio_channel_count_from_out_mask(stream->get_channels(stream));
@@ -1712,143 +1655,108 @@ static void in_update_aux_channels(struct stream_in *in,
 }
 #endif
 
-/* This function reads PCM data and:
- * - resample if needed
- * - process if pre-processors are attached
- * - discard unwanted channels
- */
-static ssize_t read_and_process_frames(struct stream_in *in, void* buffer, ssize_t frames)
-{
-    ssize_t frames_wr = 0;
-    size_t src_channels = in->config.channels;
-    size_t dst_channels = audio_channel_count_from_in_mask(in->main_channels);
-    int i;
-    void *proc_buf_out;
-    struct pcm_device *pcm_device;
-    bool has_additional_channels = (dst_channels != src_channels) ? true : false;
 #ifdef PREPROCESSING_ENABLED
-    audio_buffer_t in_buf;
-    audio_buffer_t out_buf;
-    bool has_processing = (in->num_preprocessors != 0) ? true : false;
+static ssize_t read_preprocessed_frames(struct stream_in *in, int16_t *buffer,
+                                        size_t frames)
+{
+    const size_t channels = in->config.channels;
+    const size_t reference_channels = audio_channel_count_from_in_mask(in->main_channels);
+    // WebRTC preprocessing accepts exactly 10 ms per forward and reverse call.
+    const size_t block_frames = in->requested_rate / 100;
+    const size_t block_channels = channels > reference_channels ? channels : reference_channels;
+    const size_t block_samples = block_frames * block_channels;
+    const size_t samples = 3 * block_samples;
+
+    if (in->effect_buf_samples < samples) {
+        int16_t *effect_buf = realloc(in->effect_buf, samples * sizeof(*effect_buf));
+        if (effect_buf == NULL)
+            return -ENOMEM;
+        in->effect_buf = effect_buf;
+        in->effect_buf_samples = samples;
+    }
+
+    int16_t *raw = in->effect_buf;
+    int16_t *processed = raw + block_samples;
+    int16_t *reference = processed + block_samples;
+    size_t copied = 0;
+
+    while (copied < frames) {
+        if (in->effect_frames_pending == 0) {
+            ssize_t received = read_frames(in, raw, block_frames);
+            if (received < 0)
+                return received;
+            if ((size_t)received != block_frames)
+                return -EIO;
+
+            if (in->enable_aec)
+                push_echo_reference(in, reference, processed, block_frames);
+
+            audio_buffer_t input = { .frameCount = block_frames, .s16 = raw };
+            audio_buffer_t output = { .frameCount = block_frames, .s16 = processed };
+            int status = -ENODATA;
+
+            // Effects in the same AOSP preprocessing session process together.
+            // An intermediate effect can report -ENODATA until the last one runs.
+            for (int i = 0; i < in->num_preprocessors; i++) {
+                effect_handle_t effect = in->preprocessors[i].effect_itfe;
+                status = (*effect)->process(effect, &input, &output);
+                if (status != 0 && status != -ENODATA)
+                    break;
+            }
+
+            if (status != 0 || input.frameCount != block_frames ||
+                output.frameCount != block_frames)
+                memcpy(processed, raw, block_frames * channels * sizeof(*raw));
+
+            in->effect_frames_pending = block_frames;
+        }
+
+        const size_t remaining = frames - copied;
+        const size_t available = remaining < in->effect_frames_pending
+                ? remaining : in->effect_frames_pending;
+        const size_t offset = block_frames - in->effect_frames_pending;
+        memcpy(buffer + copied * channels, processed + offset * channels,
+               available * channels * sizeof(*buffer));
+        copied += available;
+        in->effect_frames_pending -= available;
+    }
+
+    return copied;
+}
 #endif
 
-    /* Additional channels might be added on top of main_channels:
-    * - aux_channels (by processing effects)
-    * - extra channels due to HW limitations
-    * In case of additional channels, we cannot work inplace
-    */
-    if (has_additional_channels)
-        proc_buf_out = in->proc_buf_out;
-    else
-        proc_buf_out = buffer;
+/* Read and resample PCM, apply preprocessing, and discard auxiliary channels. */
+static ssize_t read_and_process_frames(struct stream_in *in, void *buffer, ssize_t frames)
+{
+    size_t src_channels = in->config.channels;
+    size_t dst_channels = audio_channel_count_from_in_mask(in->main_channels);
+    bool has_additional_channels = dst_channels != src_channels;
+    int16_t *proc_buf_out = buffer;
+    ssize_t frames_wr;
 
     if (list_empty(&in->pcm_dev_list)) {
         ALOGE("%s: pcm device list empty", __func__);
         return -EINVAL;
     }
 
-    pcm_device = node_to_item(list_head(&in->pcm_dev_list),
-                              struct pcm_device, stream_list_node);
+    if (has_additional_channels) {
+        size_t samples = frames * src_channels;
+        if (in->proc_buf_samples < samples) {
+            int16_t *new_buffer = realloc(in->proc_buf_out, samples * sizeof(*new_buffer));
+            if (new_buffer == NULL)
+                return -ENOMEM;
+            in->proc_buf_out = new_buffer;
+            in->proc_buf_samples = samples;
+        }
+        proc_buf_out = in->proc_buf_out;
+    }
 
 #ifdef PREPROCESSING_ENABLED
-    if (has_processing) {
-        /* since all the processing below is done in frames and using the config.channels
-         * as the number of channels, no changes is required in case aux_channels are present */
-        while (frames_wr < frames) {
-            /* first reload enough frames at the end of process input buffer */
-            if (in->proc_buf_frames < (size_t)frames) {
-                ssize_t frames_rd;
-                if (in->proc_buf_size < (size_t)frames) {
-                    size_t size_in_bytes = pcm_frames_to_bytes(pcm_device->pcm, frames);
-                    in->proc_buf_size = (size_t)frames;
-                    in->proc_buf_in = (int16_t *)realloc(in->proc_buf_in, size_in_bytes);
-                    ALOG_ASSERT((in->proc_buf_in != NULL),
-                                "process_frames() failed to reallocate proc_buf_in");
-                    if (has_additional_channels) {
-                        in->proc_buf_out = (int16_t *)realloc(in->proc_buf_out, size_in_bytes);
-                        ALOG_ASSERT((in->proc_buf_out != NULL),
-                                    "process_frames() failed to reallocate proc_buf_out");
-                        proc_buf_out = in->proc_buf_out;
-                    }
-                }
-                frames_rd = read_frames(in,
-                                        in->proc_buf_in +
-                                            in->proc_buf_frames * in->config.channels,
-                                        frames - in->proc_buf_frames);
-                  if (frames_rd < 0) {
-                    /* Return error code */
-                    frames_wr = frames_rd;
-                    break;
-                }
-                in->proc_buf_frames += frames_rd;
-            }
-
-            if (in->echo_reference != NULL) {
-                push_echo_reference(in, in->proc_buf_frames);
-            }
-
-             /* in_buf.frameCount and out_buf.frameCount indicate respectively
-              * the maximum number of frames to be consumed and produced by process() */
-            in_buf.frameCount = in->proc_buf_frames;
-            in_buf.s16 = in->proc_buf_in;
-            out_buf.frameCount = frames - frames_wr;
-            out_buf.s16 = (int16_t *)proc_buf_out + frames_wr * in->config.channels;
-
-            /* FIXME: this works because of current pre processing library implementation that
-             * does the actual process only when the last enabled effect process is called.
-             * The generic solution is to have an output buffer for each effect and pass it as
-             * input to the next.
-             */
-            for (i = 0; i < in->num_preprocessors; i++) {
-                (*in->preprocessors[i].effect_itfe)->process(in->preprocessors[i].effect_itfe,
-                                                   &in_buf,
-                                                   &out_buf);
-            }
-
-            /* process() has updated the number of frames consumed and produced in
-             * in_buf.frameCount and out_buf.frameCount respectively
-             * move remaining frames to the beginning of in->proc_buf_in */
-            in->proc_buf_frames -= in_buf.frameCount;
-
-            if (in->proc_buf_frames) {
-                memcpy(in->proc_buf_in,
-                       in->proc_buf_in + in_buf.frameCount * in->config.channels,
-                       in->proc_buf_frames * in->config.channels * sizeof(int16_t));
-            }
-
-            /* if not enough frames were passed to process(), read more and retry. */
-            if (out_buf.frameCount == 0) {
-                ALOGW("No frames produced by preproc");
-                continue;
-            }
-
-            if ((frames_wr + (ssize_t)out_buf.frameCount) <= frames) {
-                frames_wr += out_buf.frameCount;
-            } else {
-                /* The effect does not comply to the API. In theory, we should never end up here! */
-                ALOGE("preprocessing produced too many frames: %d + %zd  > %d !",
-                      (unsigned int)frames_wr, out_buf.frameCount, (unsigned int)frames);
-                frames_wr = frames;
-            }
-        }
-    }
+    if (in->num_preprocessors != 0)
+        frames_wr = read_preprocessed_frames(in, proc_buf_out, frames);
     else
-#endif //PREPROCESSING_ENABLED
-    {
-        /* No processing effects attached */
-        if (has_additional_channels) {
-            /* With additional channels, we cannot use original buffer */
-            if (in->proc_buf_size < (size_t)frames) {
-                size_t size_in_bytes = pcm_frames_to_bytes(pcm_device->pcm, frames);
-                in->proc_buf_size = (size_t)frames;
-                in->proc_buf_out = (int16_t *)realloc(in->proc_buf_out, size_in_bytes);
-                ALOG_ASSERT((in->proc_buf_out != NULL),
-                            "process_frames() failed to reallocate proc_buf_out");
-                proc_buf_out = in->proc_buf_out;
-            }
-        }
+#endif
         frames_wr = read_frames(in, proc_buf_out, frames);
-    }
 
     /* Remove all additional channels that have been added on top of main_channels:
      * - aux_channels
@@ -1862,13 +1770,13 @@ static ssize_t read_and_process_frames(struct stream_in *in, void* buffer, ssize
         int16_t* dst_buffer = (int16_t *)buffer;
 
         if (dst_channels == 1) {
-            for (i = frames_wr; i > 0; i--)
+            for (ssize_t i = frames_wr; i > 0; i--)
             {
                 *dst_buffer++ = *src_buffer;
                 src_buffer += src_channels;
             }
         } else {
-            for (i = frames_wr; i > 0; i--)
+            for (ssize_t i = frames_wr; i > 0; i--)
             {
                 memcpy(dst_buffer, src_buffer, dst_channels*sizeof(int16_t));
                 dst_buffer += dst_channels;
@@ -2186,8 +2094,10 @@ static int start_input_stream(struct stream_in *in)
 
     /* force read and proc buffer reallocation in case of frame size or
      * channel count change */
-    in->proc_buf_frames = 0;
-    in->proc_buf_size = 0;
+#ifdef PREPROCESSING_ENABLED
+    in->effect_frames_pending = 0;
+#endif
+    in->proc_buf_samples = 0;
     in->read_buf_size = 0;
     in->read_buf_frames = 0;
 
@@ -2406,7 +2316,7 @@ static int start_output_stream(struct stream_out *out)
 #ifdef PREPROCESSING_ENABLED
         out->echo_reference = NULL;
         out->echo_reference_generation = adev->echo_reference_generation;
-        if (adev->echo_reference != NULL)
+        if (out == adev->primary_output)
             out->echo_reference = adev->echo_reference;
 #endif
     } else {
@@ -2616,10 +2526,10 @@ static int do_out_standby_l(struct stream_out *out)
         /* stop writing to echo reference */
         if (out->echo_reference != NULL) {
             out->echo_reference->write(out->echo_reference, NULL);
-            if (out->echo_reference_generation != adev->echo_reference_generation) {
+            if (out->echo_reference_generation != out->dev->echo_reference_generation) {
                 ALOGV("%s: release_echo_reference %p", __func__, out->echo_reference);
                 release_echo_reference(out->echo_reference);
-                out->echo_reference_generation = adev->echo_reference_generation;
+                out->echo_reference_generation = out->dev->echo_reference_generation;
             }
             out->echo_reference = NULL;
         }
@@ -2981,7 +2891,7 @@ false_alarm:
             // tested above but it doesn't matter as we now have the adev mutex and it is consistent
             // with what has been set by get_echo_reference() or put_echo_reference()
             out->echo_reference_generation = adev->echo_reference_generation;
-            out->echo_reference = adev->echo_reference;
+            out->echo_reference = out == adev->primary_output ? adev->echo_reference : NULL;
             ALOGV("%s: update echo reference generation %d", __func__,
                   out->echo_reference_generation);
             pthread_mutex_unlock(&adev->lock);
@@ -3656,6 +3566,7 @@ static int add_remove_audio_effect(const struct audio_stream *stream,
         in->aux_channels_changed = false;
         ALOGV("%s: enable(%d), in->aux_channels_changed(%d)", __func__, enable, in->aux_channels_changed);
     }
+    in->effect_frames_pending = 0;
     ALOGI("%s:  num_preprocessors = %d", __func__, in->num_preprocessors);
 
     if ( memcmp(&desc.type, FX_IID_AEC, sizeof(effect_uuid_t)) == 0) {
@@ -4221,22 +4132,9 @@ static void adev_close_input_stream(struct audio_hw_device *dev,
         free(in->preprocessors[i].channel_configs);
     }
 
-    if (in->proc_buf_in) {
-        free(in->proc_buf_in);
-        in->proc_buf_in = NULL;
-    }
-
-    if (in->proc_buf_out) {
-        free(in->proc_buf_out);
-        in->proc_buf_out = NULL;
-    }
-
-    if (in->ref_buf) {
-        free(in->ref_buf);
-        in->ref_buf = NULL;
-    }
-
+    free(in->effect_buf);
 #endif
+    free(in->proc_buf_out);
 
     in_standby_l(in);
     free(stream);
